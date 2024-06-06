@@ -9,15 +9,23 @@ import (
 
 	ma "github.com/multiformats/go-multiaddr"
 	manet "github.com/multiformats/go-multiaddr/net"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/quic-go/quic-go"
 	quiclogging "github.com/quic-go/quic-go/logging"
+	quicmetrics "github.com/quic-go/quic-go/metrics"
 )
 
 type ConnManager struct {
 	reuseUDP4       *reuse
 	reuseUDP6       *reuse
 	enableReuseport bool
-	enableMetrics   bool
+
+	enableMetrics bool
+	registerer    prometheus.Registerer
+
+	metricsOnce      sync.Once
+	serverConnTracer *quiclogging.ConnectionTracer
+	clientConnTracer *quiclogging.ConnectionTracer
 
 	serverConfig *quic.Config
 	clientConfig *quic.Config
@@ -40,6 +48,7 @@ func NewConnManager(statelessResetKey quic.StatelessResetKey, tokenKey quic.Toke
 		quicListeners:   make(map[string]quicListenerEntry),
 		srk:             statelessResetKey,
 		tokenKey:        tokenKey,
+		registerer:      prometheus.DefaultRegisterer,
 	}
 	for _, o := range opts {
 		if err := o(cm); err != nil {
@@ -48,14 +57,7 @@ func NewConnManager(statelessResetKey quic.StatelessResetKey, tokenKey quic.Toke
 	}
 
 	quicConf := quicConfig.Clone()
-
-	quicConf.Tracer = func(ctx context.Context, p quiclogging.Perspective, ci quic.ConnectionID) *quiclogging.ConnectionTracer {
-		var tracer *quiclogging.ConnectionTracer
-		if qlogTracerDir != "" {
-			tracer = qloggerForDir(qlogTracerDir, p, ci)
-		}
-		return tracer
-	}
+	quicConf.Tracer = cm.getTracer()
 	serverConfig := quicConf.Clone()
 
 	cm.clientConfig = quicConf
@@ -65,6 +67,36 @@ func NewConnManager(statelessResetKey quic.StatelessResetKey, tokenKey quic.Toke
 		cm.reuseUDP6 = newReuse(&statelessResetKey, &tokenKey)
 	}
 	return cm, nil
+}
+
+func (c *ConnManager) getTracer() func(context.Context, quiclogging.Perspective, quic.ConnectionID) *quiclogging.ConnectionTracer {
+	return func(ctx context.Context, p quiclogging.Perspective, ci quic.ConnectionID) *quiclogging.ConnectionTracer {
+		c.metricsOnce.Do(func() {
+			if c.enableMetrics {
+				c.clientConnTracer = quicmetrics.NewClientConnectionTracerWithRegisterer(c.registerer)
+				c.serverConnTracer = quicmetrics.NewServerConnectionTracerWithRegisterer(c.registerer)
+			}
+		})
+		var tracer *quiclogging.ConnectionTracer
+		switch p {
+		case quiclogging.PerspectiveClient:
+			tracer = c.clientConnTracer
+		case quiclogging.PerspectiveServer:
+			tracer = c.serverConnTracer
+		default:
+			log.Errorf("invalid perspective for logging: %s", p)
+		}
+		if qlogTracerDir != "" {
+			dirTracer := qloggerForDir(qlogTracerDir, p, ci)
+			if tracer != nil {
+				tracer = quiclogging.NewMultiplexedConnectionTracer(tracer,
+					dirTracer)
+			} else {
+				tracer = dirTracer
+			}
+		}
+		return tracer
+	}
 }
 
 func (c *ConnManager) getReuse(network string) (*reuse, error) {
